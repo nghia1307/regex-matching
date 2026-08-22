@@ -1,0 +1,12 @@
+# state can contain secrets (the generated private key, the DB password)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# generated SSH keys
+*.pem
+
+# your own values
+terraform.tfvars

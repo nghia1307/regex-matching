@@ -1,0 +1,286 @@
+# =============================================================================
+# Full local stack: docker compose up --build
+#
+# Services and why each exists
+#   postgres        durable job records
+#   redis           Celery broker + result backend + LLM/prompt cache
+#   minio           S3-compatible object storage (swap for real AWS by
+#                   clearing S3_ENDPOINT_URL in .env -- no code changes)
+#   seed            one-shot: creates the bucket and the test datasets
+#   migrate         one-shot: applies Django migrations before anything serves
+#   backend         Django REST API (gunicorn) -- never does heavy work
+#   spark-master    standalone cluster manager
+#   spark-worker    executor host; scale with --scale spark-worker=N
+#   celery-worker   the Spark *driver*: consumes the "spark" queue, concurrency 1
+#   celery-default  short tasks (file inspection) so they never queue behind a
+#                   multi-million-row job
+#   celery-beat     periodic maintenance (reaps jobs whose worker died)
+#   flower          task/worker monitoring UI
+#   frontend        React + Vite dev server
+#
+# One image (./backend) runs the API, both workers, beat, flower, the seeder and
+# both Spark roles. That guarantees identical PySpark/Hadoop/JVM versions on the
+# driver and the executors, which is the usual cause of Spark version skew bugs.
+# =============================================================================
+
+x-backend-image: &backend-image
+  build:
+    context: ./backend
+  image: regex-matching/backend:local
+  env_file: .env
+  restart: unless-stopped
+
+x-backend-deps: &backend-deps
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+
+services:
+  # ------------------------------------------------------------------ storage
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-regexdb}
+      POSTGRES_USER: ${POSTGRES_USER:-regex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-regexpass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-regex} -d ${POSTGRES_DB:-regexdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Cache + broker in one instance, but on separate logical databases (see
+    # .env). allkeys-lru would evict queued tasks, so eviction stays off and the
+    # LLM cache relies on TTLs instead.
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- bootstrapping
+  seed:
+    <<: *backend-image
+    command: ["python", "/seed/seed_data.py"]
+    volumes:
+      - ./seed:/seed:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  migrate:
+    <<: *backend-image
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------------------------------------------- api
+  backend:
+    <<: *backend-image
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - --bind=0.0.0.0:8000
+      - --workers=3
+      - --timeout=120
+      - --access-logfile=-
+      - --error-logfile=-
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/health/ > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # -------------------------------------------------------------- spark cluster
+  spark-master:
+    <<: *backend-image
+    command:
+      - /bin/sh
+      - -c
+      - >
+        exec $$SPARK_HOME/bin/spark-class org.apache.spark.deploy.master.Master
+        --host spark-master --port 7077 --webui-port 8080
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+    ports:
+      - "8080:8080"   # master UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080 > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  spark-worker:
+    <<: *backend-image
+    command:
+      - /bin/sh
+      - -c
+      - >
+        exec $$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
+        spark://spark-master:7077
+        --cores ${SPARK_WORKER_CORES:-2} --memory ${SPARK_WORKER_MEMORY:-2g}
+        --webui-port 8081
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      SPARK_WORKER_DIR: /tmp/spark-local
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    # No container_name / fixed port so this can scale:
+    #   docker compose up -d --scale spark-worker=3
+    expose:
+      - "8081"
+
+  # ------------------------------------------------------------------- workers
+  celery-worker:
+    <<: *backend-image
+    # This container hosts the Spark driver. Only one SparkContext may exist per
+    # process, so concurrency is 1: jobs run one at a time here and parallelism
+    # comes from the cluster, not from the worker.
+    #
+    # prefork (not solo) with one child, deliberately. Under --pool=solo the task
+    # executes in the main thread, which also serves Celery's control channel --
+    # so a running job makes the worker stop answering ping/inspect and it
+    # disappears from Flower and /api/metrics/ for the whole run. With prefork
+    # the parent keeps answering while the single child does the work. The
+    # SparkSession is created in that child (see worker_process_init in
+    # apps/jobs/tasks.py) so no JVM is ever inherited across a fork.
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --queues=spark
+      - --concurrency=1
+      - --pool=prefork
+      - --loglevel=INFO
+      - --hostname=spark-driver@%h
+    volumes:
+      - ./backend:/app
+    ports:
+      - "4040:4040"   # Spark driver UI (stages, tasks, SQL plans)
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+
+  celery-default:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --queues=default
+      - --concurrency=2
+      - --loglevel=INFO
+      - --hostname=light@%h
+    volumes:
+      - ./backend:/app
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+
+  celery-beat:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - config
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  flower:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - config
+      - flower
+      - --port=5555
+      - --persistent=True
+      - --db=/tmp/flower.db
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ frontend
+  frontend:
+    build:
+      context: ./frontend
+    image: regex-matching/frontend:local
+    environment:
+      VITE_API_BASE: /api
+      BACKEND_ORIGIN: http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:
+  frontend-node-modules:

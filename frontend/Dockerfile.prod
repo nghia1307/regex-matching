@@ -1,0 +1,28 @@
+# Production frontend: build the bundle, then serve it from nginx.
+#
+# nginx also fronts the API, so the browser talks to exactly one origin and CORS
+# never enters the picture in production either.
+FROM node:20-alpine AS build
+
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+
+COPY . .
+# Relative base: the bundle calls /api on whatever host serves it, so the same
+# image works on an IP, a domain, or localhost with no rebuild.
+ENV VITE_API_BASE=/api
+# Relative, like VITE_API_BASE above: nginx proxies /flower/ to the flower
+# container (see nginx.conf), so this works unchanged on the EC2 IP, the
+# instance DNS, or the CloudFront domain, with no per-deployment rebuild.
+ARG VITE_FLOWER_URL=/flower/
+ENV VITE_FLOWER_URL=${VITE_FLOWER_URL}
+RUN npm run build
+
+
+FROM nginx:1.27-alpine AS serve
+
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80

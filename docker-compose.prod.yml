@@ -1,0 +1,252 @@
+# =============================================================================
+# Production stack for the EC2 deployment.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Deliberately a standalone file rather than an override of docker-compose.yml:
+# Compose *merges* list-valued keys such as `volumes`, so an override cannot
+# remove the dev bind mounts. A separate file is longer but says exactly what
+# runs in production, and can be read on its own.
+#
+# Differences from the local stack:
+#   * no MinIO -- object storage is real Amazon S3, reached with the EC2
+#     instance profile, so there are no AWS keys on the box at all
+#   * frontend is a static bundle served by nginx, which also proxies /api,
+#     so the whole app is on port 80 behind one origin
+#   * no source bind mounts, no --reload; code comes from the image
+#   * only 80 (app) and 5555 (Flower, password-protected) are published;
+#     Postgres, Redis and the Spark ports are reachable only inside the network
+# =============================================================================
+
+x-backend-image: &backend-image
+  build:
+    context: ./backend
+  image: regex-matching/backend:prod
+  env_file: .env
+  environment:
+    DJANGO_SETTINGS_MODULE: config.settings.prod
+  restart: unless-stopped
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-backend-deps: &backend-deps
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *backend-image
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    <<: *backend-image
+    command: ["python", "/seed/seed_data.py"]
+    volumes:
+      - ./seed:/seed:ro
+    restart: "no"
+    # Behind a profile so `up -d` does not run it: deploy.sh invokes it
+    # explicitly with `run --rm seed` once the stack is up.
+    profiles: ["tools"]
+
+  backend:
+    <<: *backend-image
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - --bind=0.0.0.0:8000
+      - --workers=3
+      - --timeout=120
+      - --access-logfile=-
+      - --error-logfile=-
+    expose:
+      - "8000"
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/health/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  proxy:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        # A relative path so the same bundle works whether it's opened via the
+        # EC2 IP, the instance DNS, or the CloudFront domain -- nginx proxies
+        # /flower/ to the flower container on all of them (see nginx.conf).
+        VITE_FLOWER_URL: ${VITE_FLOWER_URL:-/flower/}
+    image: regex-matching/frontend:prod
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+    logging: *logging
+
+  spark-master:
+    <<: *backend-image
+    command:
+      - /bin/sh
+      - -c
+      - >
+        exec $$SPARK_HOME/bin/spark-class org.apache.spark.deploy.master.Master
+        --host spark-master --port 7077 --webui-port 8080
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+    # Bound to localhost only: reachable through an SSH tunnel, not the internet.
+    # The Spark master UI has no authentication of its own.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080 > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging: *logging
+
+  spark-worker:
+    <<: *backend-image
+    command:
+      - /bin/sh
+      - -c
+      - >
+        exec $$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
+        spark://spark-master:7077
+        --cores ${SPARK_WORKER_CORES:-2} --memory ${SPARK_WORKER_MEMORY:-2g}
+        --webui-port 8081
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      SPARK_WORKER_DIR: /tmp/spark-local
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    expose:
+      - "8081"
+    logging: *logging
+
+  celery-worker:
+    <<: *backend-image
+    # See docker-compose.yml for why this is prefork-with-one-child and not solo.
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --queues=spark
+      - --concurrency=1
+      - --pool=prefork
+      - --loglevel=INFO
+      - --hostname=spark-driver@%h
+    ports:
+      - "127.0.0.1:4040:4040"
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+
+  celery-default:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --queues=default
+      - --concurrency=2
+      - --loglevel=INFO
+      - --hostname=light@%h
+    depends_on:
+      <<: *backend-deps
+      migrate:
+        condition: service_completed_successfully
+
+  celery-beat:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - config
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  flower:
+    <<: *backend-image
+    # Published so a reviewer can see the task/worker monitoring the brief asks
+    # for. FLOWER_BASIC_AUTH is generated by deploy.sh -- never leave it unset.
+    # --url-prefix lets nginx also reverse-proxy this at /flower/ (see
+    # nginx.conf) so the CDN domain can reach it -- CloudFront only forwards
+    # 80/443, never :5555 directly. Because of the prefix, direct :5555 access
+    # now needs the same /flower/ suffix too.
+    command:
+      - celery
+      - -A
+      - config
+      - flower
+      - --port=5555
+      - --url-prefix=flower
+      - --persistent=True
+      - --db=/tmp/flower.db
+      - --basic-auth=${FLOWER_BASIC_AUTH}
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

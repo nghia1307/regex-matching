@@ -1,2 +1,28 @@
 # secrets
 .env
+.env.prod
+*.pem
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+
+# node
+node_modules/
+dist/
+.vite/
+
+# spark / local data
+spark-warehouse/
+metastore_db/
+derby.log
+backend/.pytest_cache/
+*.log
+
+# docker volumes (if bind-mounted locally)
+.data/
